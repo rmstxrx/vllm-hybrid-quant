@@ -1,119 +1,120 @@
 # vllm-hybrid-quant
 
-**Per-layer mixed-precision quantization dispatch for vLLM** — GPTQ-Marlin INT4 for MoE experts + FP8 CUTLASS GEMMs for dense layers.
+**Hybrid GPTQ-INT4 + FP8 per-layer dispatch for vLLM** — GPTQ-Marlin INT4 for MoE experts, FP8 CUTLASS block GEMMs for dense layers. Auto-detected, no new CLI flags.
 
 ## Results
 
-On NVIDIA DGX Spark (GB10, 128 GB unified, SM 12.1) serving Qwen3.5-122B-A10B:
+NVIDIA DGX Spark (GB10, 128 GB unified, 273 GB/s) serving Qwen3.5-122B-A10B at 256k context:
 
-| Metric | GPTQ-INT4 only | Hybrid GPTQ+FP8 | Change |
-|--------|---------------|------------------|--------|
-| **Decode** | 15.0 tok/s | **21.6 tok/s** | **+44%** |
-| **ITL P50** | 66 ms | **46 ms** | -30% |
-| **ITL P99** | 133 ms | **48 ms** | -64% |
-| **KV cache** | 25.7 GiB | **31.2 GiB** | +21% |
+| Metric | GPTQ-INT4 (before) | Hybrid GPTQ+FP8 (after) | Change |
+|---|---|---|---|
+| **Decode** | 15.0 tok/s | **21.5 tok/s** | **+43%** |
+| **ITL P50** | 67 ms | **46.4 ms** | **-31%** |
+| **ITL P99** | 67 ms | **48.4 ms** | **-28%** |
+| **Model memory** | 68.4 GiB | **64.1 GiB** | **-4.3 GiB** |
+| **KV cache** | 25.8 GiB | **31.4 GiB** | **+21%** |
 
-No quality degradation — all FP8 weights are from the official `Qwen/Qwen3.5-122B-A10B-FP8` checkpoint with calibrated scales.
+FP8 weights sourced from the official calibrated `Qwen/Qwen3.5-122B-A10B-FP8` checkpoint.
 
 ## The Problem
 
 Large MoE models like Qwen3.5-122B-A10B have two categories of weights:
 
-1. **MoE expert weights** — the bulk of parameters, but only a fraction are active per token. GPTQ-INT4 (0.5 B/param via Marlin kernels) works great here.
-2. **Dense layers** — attention projections (Q/K/V/O), shared experts, embeddings. These are active on *every* token and dominate per-token memory bandwidth.
+1. **MoE expert weights** — bulk of parameters, but only a fraction active per token. GPTQ-INT4 (0.5 B/param via Marlin kernels) works great here.
+2. **Dense layers** — attention projections (Q/K/V/O), shared experts. Active on *every* token and dominate per-token memory bandwidth.
 
-The GPTQ-INT4 checkpoint only quantizes the experts. Dense layers stay at BF16 (2 B/param), creating a bandwidth bottleneck: ~18.2 GB of the ~20.6 GB per-token bandwidth comes from dense layers.
+The GPTQ-INT4 checkpoint only quantizes experts. Dense layers stay at BF16 (2 B/param), creating a bandwidth bottleneck: ~18.2 GB of the ~20.6 GB per-token read comes from dense layers.
 
-The official FP8 checkpoint quantizes these dense layers to FP8 (1 B/param) with calibrated block-128 scales. The idea: combine GPTQ-INT4 experts with FP8 dense layers to get the best of both.
+The official FP8 checkpoint has calibrated FP8 weights for these dense layers (1 B/param, block-128 scales) — but the full FP8 checkpoint (127 GB) won't fit on a single Spark at useful context lengths.
 
-### Why naive approaches fail
+**The hybrid approach:** combine GPTQ-INT4 experts with FP8 dense layers. Per-token bandwidth drops from ~20.6 GB to ~11.5 GB → theoretical **24 tok/s**, measured **21.5 tok/s**.
 
-Simply replacing BF16 tensors with FP8 in the GPTQ checkpoint (what `frankenstein.py` does) puts FP8 data on disk, but vLLM's `GPTQMarlinConfig` routes **all** non-GPTQ layers to `UnquantizedLinearMethod`, which:
-1. Allocates weight buffers at `params_dtype` (BF16)
-2. Casts FP8→BF16 at load time
-3. Runs BF16 GEMMs at BF16 bandwidth
+### Why the naive approach fails
 
-FP8 saves disk/VRAM but the matmuls run at identical bandwidth. No throughput improvement.
+Placing FP8 tensors into a GPTQ checkpoint and loading with `--quantization gptq_marlin` doesn't help — vLLM routes all non-GPTQ layers to `UnquantizedLinearMethod`, which casts FP8→BF16 at load time. You save VRAM but get zero bandwidth improvement.
 
-## The Solution
+## The Fix
 
-`GPTQMarlinHybridFp8Config` — a `GPTQMarlinConfig` subclass that implements **per-layer quantization dispatch** in `get_quant_method()`:
+A patch to two files in vLLM v0.17.1 (+116 lines) that makes `GPTQMarlinConfig` auto-detect FP8 layers and route them to `Fp8LinearMethod`:
 
-```
-┌──────────────────────────────────────────────────────┐
-│              get_quant_method(layer, prefix)          │
-├──────────────┬───────────────────┬───────────────────┤
-│  FusedMoE    │  LinearBase +     │  LinearBase +     │
-│  layers      │  FP8 checkpoint   │  everything else  │
-│              │  weights          │                   │
-├──────────────┼───────────────────┼───────────────────┤
-│  GPTQ Marlin │  Fp8LinearMethod  │  Unquantized      │
-│  MoE kernels │  (CUTLASS FP8     │  LinearMethod     │
-│  (parent)    │   block GEMMs)    │  (BF16 native)    │
-└──────────────┴───────────────────┴───────────────────┘
-```
+**`gptq_marlin.py`** — `maybe_update_config()` scans safetensors metadata for `float8_e4m3fn` weight + `weight_scale_inv` tensor pairs. Infers block size from shape ratios. Constructs `Fp8Config`. Maps HF checkpoint names to vLLM runtime names via the model's `WeightsMapper` (model-agnostic — works with any MoE architecture).
 
-Key design decisions:
-- **FP8 layer detection via checkpoint metadata** — scans safetensors for `float8_e4m3fn` tensors at config init time. No hardcoded layer lists.
-- **Dual-prefix storage** — stores both HF (`model.language_model.layers.N...`) and vLLM-mapped (`language_model.model.layers.N...`) prefixes because vLLM's `WeightsMapper` renames them.
-- **Fused module resolution** — vLLM fuses `q_proj+k_proj+v_proj→qkv_proj`. Uses `packed_modules_mapping` to resolve back to HF names for FP8 set lookup. Correctly rejects mixed fusions (e.g. `in_proj_ba` where `in_proj_a`/`in_proj_b` are BF16 despite matching `.*attn.*`).
-- **Multi-process pickle resilience** — `_ensure_fp8_initialized()` lazily rebuilds FP8 state if lost during pickle to the engine core subprocess.
-- **Zero core vLLM changes** — no modifications to `LinearBase`, `FusedMoE`, `Fp8LinearMethod`, or any kernel code. Pure `QuantizationConfig` subclass.
+**`gptq_utils.py`** — `get_linear_quant_method()` checks for FP8 layers before falling back to `UnquantizedLinearMethod`. Handles fused modules (qkv_proj, gate_up_proj) via `packed_modules_mapping`. Defers `deepcopy` to the GPTQ mutation path only — non-GPTQ layers skip it entirely.
 
-## Repository Structure
+No new config names, no new CLI flags. Just `--quantization gptq_marlin` as usual.
 
-```
-vllm-hybrid-quant/
-├── README.md                          # This file
-├── LICENSE                            # Apache 2.0
-├── src/vllm_hybrid_quant/
-│   └── gptq_marlin_hybrid_fp8.py      # The config class (production version)
-├── configs/
-│   └── quantize_config.json           # Example checkpoint config
-├── patches/
-│   ├── __init__.py.patch              # vLLM quantization __init__.py additions
-│   ├── model.py.patch                 # vLLM config/model.py override list
-│   └── gptq_marlin.py.patch           # unquant_dtypes FP8 addition (prerequisite)
-├── docs/
-│   ├── ARCHITECTURE.md                # Deep-dive on vLLM's quantization dispatch
-│   ├── DEBUGGING_JOURNAL.md           # Session findings and pitfalls
-│   └── PR_PREPARATION.md             # Upstream PR checklist and design notes
-├── tests/
-│   └── test_hybrid_routing.py         # Routing correctness tests
-└── HANDOFF.md                         # Session handoff for continuation
-```
+## Quick Start
 
-## Installation (current: local vLLM source patch)
+### 1. Build the hybrid checkpoint
+
+Downloads only the needed shards (~8 GB) from the FP8 checkpoint, extracts the 307 non-expert FP8 tensors, and grafts them into your GPTQ-INT4 checkpoint:
 
 ```bash
-# 1. Copy the config module into vLLM's quantization package
-cp src/vllm_hybrid_quant/gptq_marlin_hybrid_fp8.py \
-   $VLLM_SRC/vllm/model_executor/layers/quantization/
-
-# 2. Apply the integration patches
-cd $VLLM_SRC && git apply patches/*.patch
-
-# 3. Update checkpoint's quantize_config.json
-cp configs/quantize_config.json /path/to/hybrid-checkpoint/
-
-# 4. Launch
-vllm serve /path/to/hybrid-checkpoint \
-    --quantization gptq_marlin_hybrid_fp8 \
-    --gpu-memory-utilization 0.85 \
-    --kv-cache-dtype fp8
+python3 build-hybrid-checkpoint.py \
+    --gptq-dir ~/models/Qwen3.5-122B-A10B-GPTQ-Int4 \
+    --fp8-repo Qwen/Qwen3.5-122B-A10B-FP8 \
+    --output ~/models/qwen3.5-122b-a10b-fp8hybrid
 ```
 
-## Prerequisites
+### 2. Apply the vLLM patch
 
-1. **Hybrid checkpoint** built by `frankenstein.py`:
-   - MoE expert weights: GPTQ-INT4 (from `Qwen/Qwen3.5-122B-A10B-GPTQ-Int4`)
-   - Dense layer weights: FP8 E4M3 with block-128 scales (from `Qwen/Qwen3.5-122B-A10B-FP8`)
-   - Norms/gates/embeddings: original dtype
+```bash
+cd /path/to/vllm-src  # v0.17.1
+git apply /path/to/vllm-hybrid-quant/vllm-patch/hybrid-fp8-dispatch.patch
+```
 
-2. **vLLM 0.17.x** with CUDA support and CUTLASS FP8 block kernels (SM ≥ 89)
+### 3. Launch
 
-3. **Pre-existing patch**: `gptq_marlin.py:314` must include `torch.float8_e4m3fn` in `unquant_dtypes` for the hybrid checkpoint to load at all
+```bash
+vllm serve ~/models/qwen3.5-122b-a10b-fp8hybrid \
+    --served-model-name Qwen/Qwen3.5-122B-A10B \
+    --quantization gptq_marlin \
+    --gpu-memory-utilization 0.85 \
+    --kv-cache-dtype fp8 \
+    --max-model-len 262144 \
+    --max-num-seqs 1
+```
+
+You should see in the logs:
+```
+Hybrid GPTQ+FP8: detected 307 FP8 layers (block_size=[128, 128]). These will use Fp8LinearMethod.
+```
+
+## Repository Contents
+
+| File | Description |
+|---|---|
+| `build-hybrid-checkpoint.py` | Builds the hybrid GPTQ-INT4 + FP8 checkpoint from existing checkpoints |
+| `vllm-patch/hybrid-fp8-dispatch.patch` | vLLM v0.17.1 patch — per-layer FP8 dispatch (+116 lines, 2 files) |
+| `tests/test_gptq_fp8_hybrid.py` | 16 unit tests (layer matching, FP8 detection, WeightsMapper, pickle, deepcopy deferral) |
+
+## How It Works
+
+```
+Checkpoint load (maybe_update_config)
+  │
+  ├─ Scan safetensors metadata
+  │   ├─ FP8 weight + weight_scale_inv? → add to fp8_layers set
+  │   └─ Infer block_size from weight/scale shape ratio
+  │
+  ├─ apply_vllm_mapper() → map HF names to vLLM names
+  │
+  └─ Per-layer dispatch (get_linear_quant_method)
+      ├─ FusedMoE layer? → GPTQ-Marlin MoE kernels (unchanged)
+      ├─ GPTQ-quantized linear? → GPTQMarlinLinearMethod (unchanged)
+      ├─ In fp8_layers set? → Fp8LinearMethod (FP8 CUTLASS block GEMMs)
+      └─ Otherwise → UnquantizedLinearMethod (BF16, for norms/gates/embeddings)
+```
+
+192 dense layers routed to `Fp8LinearMethod` across 48 transformer blocks. The approach generalizes to any MoE model where dense layers bottleneck decode throughput.
+
+## Tested On
+
+- **Hardware:** NVIDIA DGX Spark GB10 (128 GB unified LPDDR5X, 273 GB/s, SM 12.1)
+- **Software:** vLLM v0.17.1, CUDA 13.0, FlashInfer attention backend
+- **Model:** Qwen3.5-122B-A10B (122B total / 10B active per token)
+- **Context:** 256k max, FP8 KV cache
 
 ## License
 
-Apache 2.0 — matching vLLM's license for upstream compatibility.
+Apache 2.0 — same as vLLM.

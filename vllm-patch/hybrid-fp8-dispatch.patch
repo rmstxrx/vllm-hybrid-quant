@@ -1,0 +1,201 @@
+diff --git a/vllm/model_executor/layers/quantization/gptq_marlin.py b/vllm/model_executor/layers/quantization/gptq_marlin.py
+index e1067e3..5c4253c 100644
+--- a/vllm/model_executor/layers/quantization/gptq_marlin.py
++++ b/vllm/model_executor/layers/quantization/gptq_marlin.py
+@@ -58,6 +58,8 @@ from vllm.model_executor.parameter import (
+ from vllm.platforms import current_platform
+ from vllm.scalar_type import scalar_types
+ from vllm.transformers_utils.config import get_safetensors_params_metadata
++
++from vllm.model_executor.layers.quantization.fp8 import Fp8Config
+ from vllm.utils.collection_utils import is_list_of
+ 
+ logger = init_logger(__name__)
+@@ -161,6 +163,13 @@ class GPTQMarlinConfig(QuantizationConfig):
+         # used to identify GPTQ model quantized by autoround
+         self.autoround_version = full_config.get("autoround_version", "")
+ 
++        # Hybrid GPTQ+FP8: populated by maybe_update_config() when the
++        # checkpoint contains FP8 tensors for non-GPTQ layers (e.g. attention,
++        # shared experts).  When set, get_linear_quant_method() routes those
++        # layers to Fp8LinearMethod instead of UnquantizedLinearMethod.
++        self.fp8_config: Fp8Config | None = None
++        self.fp8_layers: set[str] = set()
++
+     def __repr__(self) -> str:
+         return (
+             f"GPTQMarlinConfig(quant_type={self.quant_type}, "
+@@ -293,11 +302,15 @@ class GPTQMarlinConfig(QuantizationConfig):
+             quant_type=cls.TYPE_MAP[(num_bits, sym)], group_size=group_size
+         )
+ 
+-    def apply_vllm_mapper(self, hf_to_vllm_mapper):
++    def apply_vllm_mapper(self, hf_to_vllm_mapper: "WeightsMapper"):
+         if self.modules_in_block_to_quantize is not None:
+             self.modules_in_block_to_quantize = hf_to_vllm_mapper.apply_list(
+                 self.modules_in_block_to_quantize
+             )
++        if self.fp8_layers:
++            self.fp8_layers = set(hf_to_vllm_mapper.apply_list(
++                list(self.fp8_layers)
++            ))
+ 
+     def maybe_update_config(self, model_name: str, revision: str | None = None):
+         if self.modules_in_block_to_quantize:
+@@ -311,7 +324,8 @@ class GPTQMarlinConfig(QuantizationConfig):
+                 ]
+             return
+ 
+-        unquant_dtypes = [torch.float16, torch.bfloat16, torch.float32, torch.float8_e4m3fn]
++        unquant_dtypes = [torch.float16, torch.bfloat16, torch.float32,
++                          torch.float8_e4m3fn]
+         metadata = get_safetensors_params_metadata(model_name, revision=revision)
+         quant_layers: set[str] = {
+             param_name.rsplit(".", 1)[0]
+@@ -321,6 +335,60 @@ class GPTQMarlinConfig(QuantizationConfig):
+         }
+         self.modules_in_block_to_quantize = list(quant_layers)
+ 
++        # Detect FP8 layers: weight tensors stored as float8_e4m3fn that
++        # also have a corresponding weight_scale_inv tensor.  These are
++        # candidates for Fp8LinearMethod instead of UnquantizedLinearMethod.
++        fp8_weight_layers: set[str] = set()
++        has_scale_inv: set[str] = set()
++        for param_name, info in metadata.items():
++            dtype_str = info.get("dtype", None)
++            if dtype_str is None:
++                continue
++            torch_dtype = _SAFETENSORS_TO_TORCH_DTYPE.get(dtype_str)
++            layer_prefix = param_name.rsplit(".", 1)[0]
++            if param_name.endswith(".weight") and torch_dtype == torch.float8_e4m3fn:
++                fp8_weight_layers.add(layer_prefix)
++            elif param_name.endswith(".weight_scale_inv"):
++                has_scale_inv.add(layer_prefix)
++
++        # Only layers with both FP8 weight AND scale_inv qualify
++        fp8_layers = fp8_weight_layers & has_scale_inv
++        if fp8_layers:
++            # Infer block size from the first scale tensor
++            block_size = self._infer_fp8_block_size(
++                metadata, next(iter(fp8_layers)))
++            self.fp8_config = Fp8Config(
++                is_checkpoint_fp8_serialized=True,
++                activation_scheme="dynamic",
++                weight_block_size=block_size,
++            )
++            self.fp8_layers = fp8_layers
++            logger.info(
++                "Hybrid GPTQ+FP8: detected %d FP8 layers "
++                "(block_size=%s). These will use Fp8LinearMethod.",
++                len(fp8_layers), block_size)
++
++    @staticmethod
++    def _infer_fp8_block_size(
++        metadata: dict[str, dict[str, Any]],
++        layer_prefix: str,
++    ) -> list[int] | None:
++        """Infer FP8 block quantization size from weight and scale shapes."""
++        weight_info = metadata.get(f"{layer_prefix}.weight")
++        scale_info = metadata.get(f"{layer_prefix}.weight_scale_inv")
++        if weight_info is None or scale_info is None:
++            return None
++        w_shape = weight_info.get("shape")
++        s_shape = scale_info.get("shape")
++        if w_shape is None or s_shape is None or len(w_shape) != 2 or len(s_shape) != 2:
++            return None
++        # block_size = [w_dim / s_dim] for each dimension
++        block_r = w_shape[0] // s_shape[0] if s_shape[0] > 0 else 0
++        block_c = w_shape[1] // s_shape[1] if s_shape[1] > 0 else 0
++        if block_r > 0 and block_c > 0:
++            return [block_r, block_c]
++        return None
++
+ 
+ class GPTQMarlinLinearMethod(LinearMethodBase):
+     """Linear method for GPTQ Marlin.
+diff --git a/vllm/model_executor/layers/quantization/utils/gptq_utils.py b/vllm/model_executor/layers/quantization/utils/gptq_utils.py
+index dfebeca..0a60db1 100644
+--- a/vllm/model_executor/layers/quantization/utils/gptq_utils.py
++++ b/vllm/model_executor/layers/quantization/utils/gptq_utils.py
+@@ -10,6 +10,7 @@ import regex as re
+ import torch
+ 
+ from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
++from vllm.model_executor.layers.quantization.fp8 import Fp8LinearMethod
+ from vllm.model_executor.layers.vocab_parallel_embedding import (
+     ParallelLMHead,
+     UnquantizedEmbeddingMethod,
+@@ -131,28 +132,68 @@ def get_linear_quant_method(
+     prefix: str,
+     linear_method_cls: type,
+ ):
+-    cloned_config = deepcopy(config)
+     parallel_lm_head_quantized = (
+-        isinstance(layer, ParallelLMHead) and cloned_config.lm_head_quantized
++        isinstance(layer, ParallelLMHead) and config.lm_head_quantized
+     )
+     if isinstance(layer, LinearBase) or parallel_lm_head_quantized:
+         is_layer_quantized = is_layer_gptq_quantized(
+             prefix=prefix,
+-            quantized_layers=cloned_config.modules_in_block_to_quantize,
+-            fused_mapping=cloned_config.packed_modules_mapping,
++            quantized_layers=config.modules_in_block_to_quantize,
++            fused_mapping=config.packed_modules_mapping,
+         )
+         # False = skip module, None = no override, else = Positive match
+         if get_dynamic_override(  # noqa: E712
+-            cloned_config,  # noqa: E712
++            config,  # noqa: E712
+             layer_name=prefix,
+         ) == False or (not is_layer_quantized):  # noqa: E712
+             if parallel_lm_head_quantized:
+                 return UnquantizedEmbeddingMethod()
++            # Hybrid GPTQ+FP8: if this unquantized layer has FP8 weights
++            # in the checkpoint, use Fp8LinearMethod for native FP8 GEMMs
++            # instead of casting to BF16 via UnquantizedLinearMethod.
++            if (
++                hasattr(config, "fp8_config")
++                and config.fp8_config is not None
++                and _is_layer_fp8(
++                    prefix,
++                    config.fp8_layers,
++                    config.packed_modules_mapping,
++                )
++            ):
++                return Fp8LinearMethod(config.fp8_config)
+             return UnquantizedLinearMethod()
+ 
++        # Only deepcopy when we need to mutate for per-layer overrides.
++        # This avoids copying fp8_layers/fp8_config (~307 entries) for
++        # every non-GPTQ layer.
++        cloned_config = deepcopy(config)
+         if prefix:
+             # Dynamic per module/layer rules may override base config
+             override_config(cloned_config, prefix=prefix)
+ 
+         return linear_method_cls(cloned_config)
+     return None
++
++
++def _is_layer_fp8(
++    prefix: str,
++    fp8_layers: set[str],
++    fused_mapping: Mapping[str, list[str]] = MappingProxyType({}),
++) -> bool:
++    """Check if a layer has FP8 weights in the checkpoint.
++
++    Handles fused layers (e.g. qkv_proj -> q_proj, k_proj, v_proj) by
++    checking if ALL constituent shards are in the FP8 layer set.
++    """
++    proj_name = prefix.split(".")[-1]
++
++    if proj_name in fused_mapping:
++        shard_prefixes = [
++            prefix.replace(proj_name, shard_proj_name)
++            for shard_proj_name in fused_mapping[proj_name]
++        ]
++        return all(
++            any(fp8_layer in sp for fp8_layer in fp8_layers)
++            for sp in shard_prefixes
++        )
++    return any(fp8_layer in prefix for fp8_layer in fp8_layers)
