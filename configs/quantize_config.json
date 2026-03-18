@@ -1,0 +1,23 @@
+{
+    "bits": 4,
+    "group_size": 128,
+    "damp_percent": 0.01,
+    "desc_act": false,
+    "static_groups": false,
+    "sym": true,
+    "true_sequential": true,
+    "quant_method": "gptq_marlin_hybrid_fp8",
+    "dynamic": {
+        "lm_head": {},
+        "model.language_model.embed_tokens": {},
+        "-:.*attn.*": {},
+        "-:.*shared_expert.*": {},
+        "-:.*mtp.*": {},
+        "-:.*visual.*": {}
+    },
+    "modules_to_not_convert": [],
+    "fp8_config": {
+        "weight_block_size": [128, 128],
+        "activation_scheme": "dynamic"
+    }
+}

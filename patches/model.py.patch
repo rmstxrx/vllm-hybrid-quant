@@ -1,0 +1,8 @@
+--- a/vllm/config/model.py
++++ b/vllm/config/model.py
+@@ -876,6 +876,7 @@
+             overrides = [
+                 "gptq_marlin",
++                "gptq_marlin_hybrid_fp8",
+                 "awq_marlin",
+                 "inc",
