@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Frankenstein: Build a hybrid GPTQ-INT4 + FP8 checkpoint for Qwen3.5-122B-A10B.
+Build a hybrid GPTQ-INT4 + FP8 checkpoint for Qwen3.5-122B-A10B.
 
 Takes MoE expert weights from the GPTQ-INT4 checkpoint (0.5 bytes/param),
 and dense layers (attention, shared experts, embeddings) from the official
@@ -10,11 +10,10 @@ Result: a checkpoint that is ~9 GB smaller than the GPTQ-INT4 original
 while using properly calibrated FP8 scales (not naive cast), yielding
 better decode throughput on bandwidth-limited hardware.
 
-NOTE: Requires a one-line vLLM patch to gptq_marlin.py:
-  unquant_dtypes = [..., torch.float8_e4m3fn]
+NOTE: Requires the hybrid FP8 dispatch patch from https://github.com/rmstxrx/vllm/tree/v0.17.1-hybrid-fp8
 
 Usage:
-    python frankenstein.py \
+    python build-hybrid-checkpoint.py \
         --gptq-dir  ~/inference/models/hf/qwen3.5-122b-a10b-gptq-int4 \
         --fp8-repo  Qwen/Qwen3.5-122B-A10B-FP8 \
         --output    ~/inference/models/hf/qwen3.5-122b-a10b-fp8hybrid
@@ -22,7 +21,6 @@ Usage:
 
 import argparse
 import json
-import os
 import shutil
 from pathlib import Path
 
@@ -163,7 +161,7 @@ def update_safetensors_index(output_dir: Path):
     print(f"  Index rebuilt: {len(weight_map)} tensors, {total_size/1e9:.2f} GB")
 
 
-def update_config(output_dir: Path, gptq_dir: Path):
+def update_config(output_dir: Path):
     """Update config.json with hybrid quantization metadata."""
     config_path = output_dir / "config.json"
     with open(config_path) as f:
@@ -176,9 +174,9 @@ def update_config(output_dir: Path, gptq_dir: Path):
         "norms_gates_embeddings": "Preserved at source dtype (BF16 for norms/gates, FP8 for others)",
         "source_gptq": "Qwen/Qwen3.5-122B-A10B-GPTQ-Int4",
         "source_fp8": "Qwen/Qwen3.5-122B-A10B-FP8",
-        "vllm_patch": "gptq_marlin.py: add torch.float8_e4m3fn to unquant_dtypes",
+        "vllm_patch": "https://github.com/rmstxrx/vllm/tree/v0.17.1-hybrid-fp8",
         "target_hardware": "NVIDIA DGX Spark (GB10, 128GB unified, 273 GB/s)",
-        "converter": "frankenstein.py"
+        "converter": "build-hybrid-checkpoint.py"
     }
     
     with open(config_path, "w") as f:
@@ -196,7 +194,7 @@ def main():
     gptq_dir = Path(args.gptq_dir)
     output_dir = Path(args.output)
     
-    print("=== Frankenstein: GPTQ-INT4 + FP8 Hybrid Builder ===")
+    print("=== Hybrid GPTQ-INT4 + FP8 Checkpoint Builder ===")
     print(f"  GPTQ source: {gptq_dir}")
     print(f"  FP8 source:  {args.fp8_repo}")
     print(f"  Output:      {output_dir}")
@@ -240,7 +238,7 @@ def main():
     # Step 5: Update index and config
     print(f"\n[5/5] Updating index and config...")
     update_safetensors_index(output_dir)
-    update_config(output_dir, gptq_dir)
+    update_config(output_dir)
     
     # Cleanup downloaded FP8 shards
     shutil.rmtree(cache_dir, ignore_errors=True)

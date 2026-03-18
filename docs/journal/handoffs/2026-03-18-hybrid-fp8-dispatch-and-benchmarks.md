@@ -4,6 +4,8 @@
 **Author:** Claude (Opus 4.6) + Rômulo
 **Status:** Code complete, forum post drafted, GPQA Diamond benchmark needs redo
 
+**Update (2026-03-18 evening):** Repo restructured — vLLM changes moved to fork at rmstxrx/vllm branch v0.17.1-hybrid-fp8. Standalone repo now contains only the checkpoint builder.
+
 ---
 
 ## What was accomplished
@@ -38,8 +40,7 @@ Full `inference-bench` results at `/tmp/bench_256k.txt` on Apollyon.
 
 `https://github.com/rmstxrx/vllm-hybrid-quant` — pushed with:
 - `build-hybrid-checkpoint.py` (renamed from frankenstein.py)
-- `vllm-patch/hybrid-fp8-dispatch.patch`
-- `tests/test_gptq_fp8_hybrid.py`
+- vLLM fork: `https://github.com/rmstxrx/vllm/tree/v0.17.1-hybrid-fp8` (patch + tests)
 - Updated README with 256k benchmark numbers
 
 ### Forum post drafted (ready to post)
