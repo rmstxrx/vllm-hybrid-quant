@@ -39,7 +39,7 @@ This project has two parts:
 
 | Component | Location | Description |
 |---|---|---|
-| **vLLM patch** | [`rmstxrx/vllm`](https://github.com/rmstxrx/vllm/tree/v0.17.1-hybrid-fp8) | Fork of vLLM v0.17.1 with per-layer FP8 dispatch (+130 lines, 2 files, 19 tests) |
+| **vLLM patch** | [`rmstxrx/vllm`](https://github.com/rmstxrx/vllm/tree/v0.17.1-hybrid-fp8) | Fork of vLLM v0.17.1 with per-layer FP8 dispatch (~150 lines, 2 files, 19 tests) |
 | **Checkpoint builder** | `build-hybrid-checkpoint.py` (this repo) | Builds the hybrid GPTQ-INT4 + FP8 checkpoint from existing HuggingFace checkpoints |
 
 ## Quick Start
